@@ -1,8 +1,8 @@
 /**
  * usage-bar — AI subscription usage gauge for the opencode TUI.
  *
- * Renders a compact usage strip in the `app_bottom` slot — a full-width row
- * just below the session footer:
+ * Renders a compact usage strip in the `app` slot — a full-width row at the
+ * bottom of the interface, below the session footer:
  *
  *   ▓▓▓▓░░ 65% · 0h 11m                                  (one window)
  *   cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h   oai ▓░░░░ 12% · 3h 4m
@@ -21,11 +21,11 @@
  * commented defaults on first run; read once at startup). Tokens/keys are
  * only ever sent to their own provider's API host.
  *
- * Loaded via tui.json, e.g.:
- *   { "plugin": ["@satas/opencode-usage-bar"] }      // published npm package
- *   { "plugin": ["/abs/path/to/src/index.tsx"] }     // local file (no build)
+ * Loaded via cli.json (opencode v2), e.g.:
+ *   { "plugins": ["@satas/opencode-usage-bar"] }        // published npm package
+ *   { "plugins": ["/abs/path/to/opencode-usage-bar"] }  // local checkout (no build)
  */
-import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { Plugin, usePlugin } from "@opencode/plugin/tui"
 import { createMemo, createSignal, For, Show } from "solid-js"
 import { readFile, writeFile, mkdir } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -91,6 +91,20 @@ function expandTilde(p: string) {
   return p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p
 }
 
+/** opencode's global config directory (XDG-aware, matching opencode itself). */
+function configDir() {
+  return process.env.XDG_CONFIG_HOME
+    ? join(process.env.XDG_CONFIG_HOME, "opencode")
+    : join(homedir(), ".config", "opencode")
+}
+
+/** opencode's global data directory (XDG-aware, matching opencode itself). */
+function stateDir() {
+  return process.env.XDG_DATA_HOME
+    ? join(process.env.XDG_DATA_HOME, "opencode")
+    : join(homedir(), ".local", "share", "opencode")
+}
+
 function fmtDuration(ms: number) {
   const totalMinutes = Math.max(0, Math.ceil(ms / 60_000))
   const days = Math.floor(totalMinutes / 1440)
@@ -152,9 +166,8 @@ type OpencodeAuthEntry = {
   accountId?: string
 }
 
-/** Set from `api.state.path.state` at startup; default matches opencode's
- *  XDG data dir. */
-let opencodeAuthFile = join(homedir(), ".local", "share", "opencode", "auth.json")
+/** opencode's own auth store (`opencode auth login`); XDG-aware default. */
+let opencodeAuthFile = join(stateDir(), "auth.json")
 
 /** Read a provider's entry from opencode's own auth store
  *  (`opencode auth login`). Returns null when missing/unreadable. */
@@ -410,13 +423,7 @@ function parseConfig(raw: string): UsageBarConfig {
 /** Load `<config dir>/usage-bar.toml`, creating it with commented defaults on
  *  first run. Any failure falls back to defaults without touching an existing
  *  file. */
-async function loadConfig(configPath: string | undefined): Promise<UsageBarConfig> {
-  const dir =
-    configPath && !configPath.endsWith(".json")
-      ? configPath
-      : configPath
-        ? dirname(configPath)
-        : join(homedir(), ".config", "opencode")
+async function loadConfig(dir: string): Promise<UsageBarConfig> {
   const file = join(dir, CONFIG_FILE)
 
   try {
@@ -443,133 +450,163 @@ async function loadConfig(configPath: string | undefined): Promise<UsageBarConfi
 // Plugin
 // ---------------------------------------------------------------------------
 
-const tui: TuiPlugin = async (api) => {
-  const config = await loadConfig(api.state.path?.config)
-  if (api.state.path?.state) opencodeAuthFile = join(api.state.path.state, "auth.json")
+export default Plugin.define({
+  id: "opencode-usage-bar",
+  async setup(context) {
+    opencodeAuthFile = join(stateDir(), "auth.json")
+    const config = await loadConfig(configDir())
 
-  const enabled = providers.filter((p) => config.providers[p.id].enabled)
-  if (enabled.length === 0) return // nothing to poll or render
+    const enabled = providers.filter((p) => config.providers[p.id].enabled)
+    if (enabled.length === 0) return // nothing to poll or render
 
-  const seed: Record<string, UsageWindow[]> = {}
-  for (const p of enabled) {
-    const cached = api.kv.get<UsageWindow[] | undefined>(`usage-bar.${p.id}.windows`, undefined)
-    if (cached) seed[p.id] = cached
-  }
-  const [byProvider, setByProvider] = createSignal<Record<string, UsageWindow[]>>(seed)
-  // Status is deliberately not cached across restarts: incidents are
-  // short-lived, and the first poll lands seconds after startup anyway.
-  const [byStatus, setByStatus] = createSignal<Record<string, StatusIndicator>>({})
-  const [now, setNow] = createSignal(Date.now())
+    // Durable, plugin-scoped storage (survives restarts, synced across TUIs).
+    const [cached, setCached] = context.storage.store<Record<string, UsageWindow[]>>("windows", {
+      initial: {},
+    })
 
-  setInterval(() => setNow(Date.now()), 1_000)
-
-  for (const p of enabled) {
-    const cfg = config.providers[p.id]
-    const poll = async () => {
-      // Fetch usage and status concurrently; status pages are CDN-backed and
-      // never throttle, so we poll them on the same cadence as usage.
-      const statusP = config.showStatus && p.statusUrl ? fetchStatus(p.statusUrl) : null
-      const [all, status] = await Promise.all([p.fetchUsage(cfg), statusP])
-      if (all) {
-        const windows = all.filter((w) => cfg.show[w.category] && w.resetsAt > Date.now())
-        setByProvider((prev) => ({ ...prev, [p.id]: windows }))
-        api.kv.set(`usage-bar.${p.id}.windows`, windows)
-      }
-      // `null` means the status fetch failed — keep the last known indicator.
-      if (status !== null) setByStatus((prev) => ({ ...prev, [p.id]: status }))
-      // Back off when the usage fetch failed (e.g. 429 — these endpoints throttle).
-      setTimeout(poll, all ? POLL_MS : POLL_MS * 3)
+    const seed: Record<string, UsageWindow[]> = {}
+    for (const p of enabled) {
+      const windows = cached[p.id]
+      if (windows?.length) seed[p.id] = windows.map((w) => ({ ...w }))
     }
-    void poll()
-  }
+    const [byProvider, setByProvider] = createSignal<Record<string, UsageWindow[]>>(seed)
+    // Status is deliberately not cached across restarts: incidents are
+    // short-lived, and the first poll lands seconds after startup anyway.
+    const [byStatus, setByStatus] = createSignal<Record<string, StatusIndicator>>({})
+    const [now, setNow] = createSignal(Date.now())
 
-  api.slots.register({
-    order: 60,
-    slots: {
-      // `app_bottom` renders as a full-width row below the session footer.
-      app_bottom() {
-        const theme = () => api.theme.current
+    let disposed = false
+    const timers = new Set<ReturnType<typeof setTimeout>>()
+    const later = (fn: () => void, ms: number) => {
+      const timer = setTimeout(() => {
+        timers.delete(timer)
+        fn()
+      }, ms)
+      timers.add(timer)
+    }
 
-        type Group = { short: string; status: StatusIndicator; windows: UsageWindow[] }
-        const groups = createMemo<Group[]>(() => {
-          const map = byProvider()
-          const statusMap = byStatus()
-          const out: Group[] = []
-          for (const p of enabled) {
-            // Drop windows that have reset since the last poll.
-            const windows = (map[p.id] ?? []).filter((w) => w.resetsAt > now())
-            if (windows.length > 0)
-              out.push({ short: p.short, status: statusMap[p.id] ?? "none", windows })
-          }
-          return out
-        })
-        const totalWindows = createMemo(() =>
-          groups().reduce((sum, g) => sum + g.windows.length, 0),
-        )
-        const barWidth = createMemo(() => config.barWidth ?? (totalWindows() === 1 ? 6 : 5))
-        const multiProvider = createMemo(() => groups().length >= 2)
+    const ticker = setInterval(() => setNow(Date.now()), 1_000)
 
-        const pctOf = (w: UsageWindow) => Math.min(100, Math.max(0, Math.round(w.percent)))
-        const filledOf = (w: UsageWindow) =>
-          Math.min(barWidth(), Math.max(0, Math.round((pctOf(w) / 100) * barWidth())))
-        const colorOf = (w: UsageWindow) => {
-          const t = theme()
-          const pct = pctOf(w)
-          if (pct > 85) return t.error
-          if (pct >= 50) return t.warning
-          return t.success
+    for (const p of enabled) {
+      const cfg = config.providers[p.id]
+      const poll = async () => {
+        if (disposed) return
+        // Fetch usage and status concurrently; status pages are CDN-backed and
+        // never throttle, so we poll them on the same cadence as usage.
+        const statusP = config.showStatus && p.statusUrl ? fetchStatus(p.statusUrl) : null
+        const [all, status] = await Promise.all([p.fetchUsage(cfg), statusP])
+        if (disposed) return
+        if (all) {
+          const windows = all.filter((w) => cfg.show[w.category] && w.resetsAt > Date.now())
+          setByProvider((prev) => ({ ...prev, [p.id]: windows }))
+          void setCached((draft) => {
+            draft[p.id] = windows
+          })
         }
-        // Status marker color: red for severe incidents, amber for minor,
-        // cyan for scheduled maintenance.
-        const statusColor = (s: StatusIndicator) => {
-          const t = theme()
-          if (s === "critical" || s === "major") return t.error
-          if (s === "minor") return t.warning
-          return t.info
+        // `null` means the status fetch failed — keep the last known indicator.
+        if (status !== null) setByStatus((prev) => ({ ...prev, [p.id]: status }))
+        // Back off when the usage fetch failed (e.g. 429 — these endpoints throttle).
+        later(poll, all ? POLL_MS : POLL_MS * 3)
+      }
+      void poll()
+    }
+
+    function UsageBar() {
+      const theme = usePlugin().theme
+
+      type Group = { short: string; status: StatusIndicator; windows: UsageWindow[] }
+      const groups = createMemo<Group[]>(() => {
+        const map = byProvider()
+        const statusMap = byStatus()
+        const out: Group[] = []
+        for (const p of enabled) {
+          // Drop windows that have reset since the last poll.
+          const windows = (map[p.id] ?? []).filter((w) => w.resetsAt > now())
+          if (windows.length > 0)
+            out.push({ short: p.short, status: statusMap[p.id] ?? "none", windows })
         }
+        return out
+      })
+      const totalWindows = createMemo(() => groups().reduce((sum, g) => sum + g.windows.length, 0))
+      const barWidth = createMemo(() => config.barWidth ?? (totalWindows() === 1 ? 6 : 5))
+      const multiProvider = createMemo(() => groups().length >= 2)
 
-        return (
-          <Show when={groups().length > 0}>
-            <box flexDirection="row" gap={3} alignItems="center" width="100%" paddingLeft={1}>
-              <For each={groups()}>
-                {(g) => (
-                  <box flexDirection="row" gap={2} alignItems="center" flexShrink={0}>
-                    <Show when={config.showStatus && g.status !== "none"}>
-                      <text fg={statusColor(g.status)}>!</text>
-                    </Show>
-                    <Show when={multiProvider()}>
-                      <text fg={theme().textMuted}>{g.short}</text>
-                    </Show>
-                    <For each={g.windows}>
-                      {(w) => (
-                        <box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
-                          <Show when={g.windows.length >= 2}>
-                            <text fg={theme().textMuted}>{w.label}</text>
-                          </Show>
-                          <Show when={config.showBars}>
-                            <box flexDirection="row">
-                              <text fg={colorOf(w)}>{"▓".repeat(filledOf(w))}</text>
-                              <text fg={theme().textMuted}>
-                                {"░".repeat(barWidth() - filledOf(w))}
-                              </text>
-                            </box>
-                          </Show>
-                          <text fg={theme().text}>{pctOf(w)}%</text>
-                          <text fg={theme().textMuted}>· {fmtDuration(w.resetsAt - now())}</text>
-                        </box>
-                      )}
-                    </For>
-                  </box>
-                )}
-              </For>
-            </box>
-          </Show>
-        )
-      },
-    },
-  })
-}
+      const pctOf = (w: UsageWindow) => Math.min(100, Math.max(0, Math.round(w.percent)))
+      const filledOf = (w: UsageWindow) =>
+        Math.min(barWidth(), Math.max(0, Math.round((pctOf(w) / 100) * barWidth())))
+      const colorOf = (w: UsageWindow) => {
+        const pct = pctOf(w)
+        if (pct > 85) return theme.text.feedback.error.base
+        if (pct >= 50) return theme.text.feedback.warning.base
+        return theme.text.feedback.success.base
+      }
+      // Status marker color: red for severe incidents, amber for minor,
+      // cyan for scheduled maintenance.
+      const statusColor = (s: StatusIndicator) => {
+        if (s === "critical" || s === "major") return theme.text.feedback.error.base
+        if (s === "minor") return theme.text.feedback.warning.base
+        return theme.text.feedback.info.base
+      }
 
-const plugin = { id: "opencode-usage-bar", tui } satisfies TuiPluginModule
+      return (
+        <Show when={groups().length > 0}>
+          {/* The `app` slot imposes no intrinsic height; pin the row to one line. */}
+          <box
+            flexDirection="row"
+            gap={3}
+            alignItems="center"
+            width="100%"
+            height={1}
+            paddingLeft={1}
+          >
+            <For each={groups()}>
+              {(g) => (
+                <box flexDirection="row" gap={2} alignItems="center" flexShrink={0}>
+                  <Show when={config.showStatus && g.status !== "none"}>
+                    <text fg={statusColor(g.status)}>!</text>
+                  </Show>
+                  <Show when={multiProvider()}>
+                    <text fg={theme.text.muted}>{g.short}</text>
+                  </Show>
+                  <For each={g.windows}>
+                    {(w) => (
+                      <box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
+                        <Show when={g.windows.length >= 2}>
+                          <text fg={theme.text.muted}>{w.label}</text>
+                        </Show>
+                        <Show when={config.showBars}>
+                          <box flexDirection="row">
+                            <text fg={colorOf(w)}>{"▓".repeat(filledOf(w))}</text>
+                            <text fg={theme.text.muted}>
+                              {"░".repeat(barWidth() - filledOf(w))}
+                            </text>
+                          </box>
+                        </Show>
+                        <text fg={theme.text.base}>{pctOf(w)}%</text>
+                        <text fg={theme.text.muted}>· {fmtDuration(w.resetsAt - now())}</text>
+                      </box>
+                    )}
+                  </For>
+                </box>
+              )}
+            </For>
+          </box>
+        </Show>
+      )
+    }
 
-export default plugin
+    // `app` renders as a full-width row at the bottom of the TUI, below the
+    // session footer — the v2 equivalent of v1's `app_bottom` slot.
+    context.ui.slot({
+      append: "app",
+      render: () => <UsageBar />,
+    })
+
+    return () => {
+      disposed = true
+      clearInterval(ticker)
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear()
+    }
+  },
+})

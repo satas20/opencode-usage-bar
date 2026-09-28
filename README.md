@@ -51,33 +51,32 @@ When a provider's public status page reports an active incident, a colored
 ### Recommended (npm)
 
 ```sh
-opencode plugin @satas/opencode-usage-bar
+opencode plugin add @satas/opencode-usage-bar
 ```
 
 This installs the package via Bun, detects the TUI entrypoint, and adds it to
-your `tui.json` automatically. Add `-g` to install globally
-(`~/.config/opencode/tui.json`).
+your global `cli.json` automatically.
 
 Or add it manually:
 
 ```jsonc
-// ~/.config/opencode/tui.json
+// ~/.config/opencode/cli.json
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["@satas/opencode-usage-bar"]
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": ["@satas/opencode-usage-bar"]
 }
 ```
 
-opencode auto-installs npm plugins at startup.
+### Local checkout (no build needed)
 
-### Local file (no build needed)
-
-opencode transpiles `.tsx` plugins on the fly, so you can point `tui.json`
-straight at the source file:
+opencode transpiles `.tsx` plugins on the fly, so you can point `cli.json`
+straight at a checkout — its root `tui.tsx` forwards to `src/index.tsx`:
 
 ```jsonc
+// ~/.config/opencode/cli.json
 {
-  "plugin": ["/absolute/path/to/opencode-usage-bar/src/index.tsx"]
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": ["/absolute/path/to/opencode-usage-bar"]
 }
 ```
 
@@ -131,7 +130,7 @@ change without notice.
 ## Develop
 
 ```sh
-bun install      # dev deps (solid-js, @opencode-ai/plugin, @opentui/solid, tsc)
+bun install      # dev deps (solid-js, @opencode/plugin, @opentui/solid, tsc)
 bun run build    # emit dist/index.js + dist/index.d.ts (for npm publish)
 bun run typecheck
 ```
@@ -147,7 +146,7 @@ automatically).
 
 ## Requirements
 
-- opencode >= 1.17 (TUI plugin API, `@opencode-ai/plugin/tui`)
+- opencode >= 2.0 (TUI plugin API, `@opencode/plugin/tui`)
 - Bun runtime (used by opencode; `Bun.TOML` parses the config)
 
 ## Contributing

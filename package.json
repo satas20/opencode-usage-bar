@@ -1,6 +1,6 @@
 {
   "name": "@satas/opencode-usage-bar",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "AI subscription usage gauge with provider status for the opencode TUI (Claude Pro/Max, ChatGPT Plus/Pro) — shows ▓▓▓░░░ 36% · 0h 39m and a ! marker during incidents.",
   "type": "module",
   "license": "MIT",
@@ -25,23 +25,26 @@
   },
   "files": ["dist"],
   "engines": {
-    "opencode": ">=1.17"
+    "opencode": ">=2.0.0"
   },
   "scripts": {
     "build": "bun run build.ts && tsc",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run build"
   },
+  "dependencies": {
+    "@opencode/plugin": ">=2.0.0"
+  },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.17",
-    "@opentui/solid": "*",
-    "solid-js": "*"
+    "@opentui/core": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
+    "solid-js": ">=1.9.0"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": ">=1.17",
-    "@opentui/solid": "^0.4.3",
+    "@opentui/core": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
     "@types/node": "^26.1.1",
-    "solid-js": "*",
+    "solid-js": ">=1.9.0",
     "typescript": "^5"
   }
 }
