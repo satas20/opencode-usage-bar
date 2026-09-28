@@ -5,18 +5,21 @@
 An AI subscription usage gauge for the [opencode](https://opencode.ai) TUI.
 
 Shows how much of your coding-plan quota you've used and how long until it
-resets, in a full-width row just below the session footer. Supports
-**OpenCode Go/Plus**, **Claude Pro/Max** and **ChatGPT Plus/Pro (Codex)** —
-each optional, each with per-window toggles.
+resets. By default the gauge sits in the prompt footer row, next to the
+location and the context/cost readouts — compact by default, expanding to
+every enabled window when there is room — and a full-detail strip is
+right-aligned on the bottom row of the interface. Either surface can be
+disabled with `placement`. Supports **OpenCode Go/Plus**, **Claude Pro/Max**
+and **ChatGPT Plus/Pro (Codex)** — each optional, each with per-window toggles.
 
 ```
-┌─ opencode session ────────────────────────────────────┐
-│ ...                                                   │
-│ > _                                                   │
-│ Build · Claude Fable 5      ▓▓▓▓░░░░░░ 4/5 · todo bar │
-│ esc interrupt        119.8K (12%) · $4.04  ctrl+p     │
-│ ▓▓▓▓░░ 65% · 0h 11m                                   │
-└───────────────────────────────────────────────────────┘
+┌─ opencode session ──────────────────────────────────────────┐
+│ ...                                                         │
+│ > _                                                         │
+│ Build · Claude Fable 5                                      │
+│ ~/code/app  cld 5h ▓▓▓▓░ 65% · 0h 11m  119.8K · 12% · $4.04 │
+│ cld ▓▓▓▓░ 65% · 0h 11m   oai ▓░░░░ 12% · 3h 4m  (status bar)│
+└─────────────────────────────────────────────────────────────┘
 ```
 
 With multiple windows/providers enabled:
@@ -42,7 +45,11 @@ When a provider's public status page reports an active incident, a colored
   failures — these endpoints throttle aggressive polling).
 - Last known values are cached, so the bar appears instantly on restart.
 - Providers hide silently when credentials are missing/expired or a fetch
-  fails; the whole row hides when nothing is available.
+  fails; the gauge hides too when nothing is available, or when the footer row
+  is too narrow even for the compact form.
+- In the prompt footer the gauge shows the most constrained window per provider
+  and expands to the full list when the host reports room for details;
+  `placement = "footer"` (or `"app"`) disables the other surface.
 - Provider prefixes (`cld`/`oai`/`ocg`) appear only when two or more providers
   are visible; window labels (`5h`/`7d`/…) appear only when a provider shows
   two or more windows.
@@ -92,6 +99,7 @@ config is read once at startup.
 [ui]
 show_bars = true      # render ▓▓░░ mini-bars (false = text only)
 show_status = true    # show a ! marker next to a provider during incidents
+placement = "both"    # footer (prompt footer), app (bottom strip), or both
 # bar_width = 6       # override bar width (default: 6 for a single window, 5 otherwise)
 
 [anthropic]
