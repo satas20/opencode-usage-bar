@@ -11,6 +11,7 @@
  * Providers:
  *   anthropic — Claude Pro/Max via the OAuth token in ~/.claude/.credentials.json
  *   openai    — ChatGPT Plus/Pro via the Codex CLI login in ~/.codex/auth.json
+ *   opencode  — OpenCode Go/Plus via the Console account login (`/connect`)
  *
  * When a provider's public status page reports an incident, a colored `!`
  * marker appears next to its prefix (red = major/critical, amber = minor,
@@ -31,6 +32,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { Buffer } from "node:buffer"
+import { Database } from "bun:sqlite"
 
 const POLL_MS = 120_000
 const FETCH_TIMEOUT_MS = 10_000
@@ -41,7 +43,7 @@ const CONFIG_FILE = "usage-bar.toml"
 // ---------------------------------------------------------------------------
 
 /** Which quota window a value belongs to; toggled per provider in config. */
-type WindowCategory = "5h" | "7d" | "model"
+type WindowCategory = "5h" | "7d" | "model" | "month"
 
 /** Provider health from the vendor's public status page (Statuspage schema). */
 type StatusIndicator = "none" | "minor" | "major" | "critical" | "maintenance"
@@ -56,7 +58,7 @@ type UsageWindow = {
   resetsAt: number
 }
 
-type ProviderId = "anthropic" | "openai"
+type ProviderId = "anthropic" | "openai" | "opencode"
 
 type ProviderConfig = {
   enabled: boolean
@@ -80,6 +82,10 @@ type Provider = {
   short: string
   /** vendor status page JSON endpoint (Statuspage `status.json`); optional */
   statusUrl?: string
+  /** Distinguishes "signed out" (cached windows are dropped and the provider
+   *  hides) from a transient fetch failure (last known values are kept).
+   *  Providers without this hook always keep their cache on failure. */
+  hasCredentials?(cfg: ProviderConfig): Promise<boolean>
   fetchUsage(cfg: ProviderConfig): Promise<UsageWindow[] | null>
 }
 
@@ -185,6 +191,71 @@ async function opencodeAuth(...ids: string[]): Promise<OpencodeAuthEntry | null>
   } catch {
     return null
   }
+}
+
+// ---------------------------------------------------------------------------
+// OpenCode Console account (OpenCode Go / Go Plus)
+// ---------------------------------------------------------------------------
+
+/** Console base URL; the Go status endpoint lives at `<server>/api/go/status`. */
+const CONSOLE_SERVER = "https://opencode.ai/console"
+
+type ConsoleCredential = {
+  server: string
+  access: string
+  /** epoch ms; 0 = no expiry */
+  expires: number
+}
+
+/** Read the active `opencode` (OpenCode Console) OAuth credential written by
+ *  the Console account device login (`/connect`). v2 keeps credentials in its
+ *  SQLite store; auth.json remains as the legacy fallback. Read-only — the
+ *  token is never refreshed or rewritten; when it is expired the provider
+ *  simply hides until the account is reconnected. */
+async function opencodeConsoleCredential(): Promise<ConsoleCredential | null> {
+  try {
+    const db = new Database(join(stateDir(), "opencode.db"), { readonly: true })
+    try {
+      const row = db
+        .query<{ value?: string }>(
+          "select value from credential where integration_id = 'opencode' and active = 1 order by time_updated desc limit 1",
+        )
+        .get()
+      if (row?.value) {
+        const cred = JSON.parse(row.value) as {
+          type?: string
+          access?: string
+          expires?: number
+          metadata?: { server?: string }
+        }
+        if (cred.type === "oauth" && cred.access && !(cred.expires && Date.now() >= cred.expires)) {
+          return {
+            server: cred.metadata?.server ?? CONSOLE_SERVER,
+            access: cred.access,
+            expires: typeof cred.expires === "number" ? cred.expires : 0,
+          }
+        }
+      }
+    } finally {
+      db.close()
+    }
+  } catch {
+    // fall through to the legacy auth store
+  }
+
+  const entry = await opencodeAuth("opencode")
+  if (entry?.access && !(entry.expires && Date.now() >= entry.expires)) {
+    return { server: CONSOLE_SERVER, access: entry.access, expires: entry.expires ?? 0 }
+  }
+  return null
+}
+
+/** One quota window on the Go subscription. Money is microcents in strings. */
+type GoMeter = {
+  startsAt?: string
+  resetsAt?: string
+  limitMicroCents?: string | number
+  usedMicroCents?: string | number
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +406,54 @@ function parseWhamWindow(
   return { category, label: category, percent: w.used_percent, resetsAt }
 }
 
-const providers: Provider[] = [anthropicProvider, openaiProvider]
+/** OpenCode Go / Go Plus — the subscription shown on the Console `Go` page.
+ *  Reads the Console account credential and calls the same status endpoint
+ *  the web UI uses; money is microcents, so `percent = used / limit`. */
+const opencodeProvider: Provider = {
+  id: "opencode",
+  short: "ocg",
+  async hasCredentials() {
+    return (await opencodeConsoleCredential()) !== null
+  },
+  async fetchUsage() {
+    const cred = await opencodeConsoleCredential()
+    if (!cred) return null
+
+    const data = (await fetchJson(`${cred.server}/api/go/status`, {
+      authorization: `Bearer ${cred.access}`,
+      accept: "application/json",
+    })) as {
+      access?: {
+        meters?: { fiveHour?: GoMeter; week?: GoMeter; month?: GoMeter } | null
+      } | null
+    } | null
+    const meters = data?.access?.meters
+    if (!meters) return null
+
+    const windows: UsageWindow[] = []
+    const add = (category: WindowCategory, meter: GoMeter | undefined) => {
+      if (!meter) return
+      const limit = Number(meter.limitMicroCents)
+      const used = Number(meter.usedMicroCents)
+      const resetsAt = typeof meter.resetsAt === "string" ? Date.parse(meter.resetsAt) : NaN
+      if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(used) || Number.isNaN(resetsAt))
+        return
+      // Same rounding as the Console web UI.
+      windows.push({
+        category,
+        label: category,
+        percent: Math.round((used / limit) * 100),
+        resetsAt,
+      })
+    }
+    add("5h", meters.fiveHour)
+    add("7d", meters.week)
+    add("month", meters.month)
+    return windows.length > 0 ? windows : null
+  },
+}
+
+const providers: Provider[] = [anthropicProvider, openaiProvider, opencodeProvider]
 
 // ---------------------------------------------------------------------------
 // Config
@@ -361,6 +479,12 @@ enabled = false       # ChatGPT Plus/Pro via the Codex CLI login
 show_5h = true
 show_7d = false
 # codex_auth_path = "~/.codex/auth.json"
+
+[opencode]
+enabled = true        # OpenCode Go/Plus via the Console account login (/connect)
+show_5h = true        # rolling 5-hour window
+show_7d = true        # UTC calendar week
+show_month = true     # paid billing period
 `
 
 function defaultConfig(): UsageBarConfig {
@@ -368,6 +492,7 @@ function defaultConfig(): UsageBarConfig {
     "5h": true,
     "7d": false,
     model: false,
+    month: false,
     ...over,
   })
   return {
@@ -376,6 +501,7 @@ function defaultConfig(): UsageBarConfig {
     providers: {
       anthropic: { enabled: true, show: show() },
       openai: { enabled: false, show: show() },
+      opencode: { enabled: true, show: show({ "7d": true, month: true }) },
     },
   }
 }
@@ -407,13 +533,14 @@ function parseConfig(raw: string): UsageBarConfig {
   if (typeof rawWidth === "number" && Number.isFinite(rawWidth) && rawWidth >= 1)
     cfg.barWidth = Math.min(40, Math.floor(rawWidth))
 
-  for (const id of ["anthropic", "openai"] as ProviderId[]) {
+  for (const id of ["anthropic", "openai", "opencode"] as ProviderId[]) {
     const t = asTable(root[id])
     const p = cfg.providers[id]
     p.enabled = bool(t["enabled"], p.enabled)
     p.show["5h"] = bool(t["show_5h"], p.show["5h"])
     p.show["7d"] = bool(t["show_7d"], p.show["7d"])
     p.show.model = bool(t["show_model"], p.show.model)
+    p.show.month = bool(t["show_month"], p.show.month)
     p.credentialsPath = str(t["credentials_path"])
     p.codexAuthPath = str(t["codex_auth_path"])
   }
@@ -466,7 +593,18 @@ export default Plugin.define({
 
     const seed: Record<string, UsageWindow[]> = {}
     for (const p of enabled) {
-      const windows = cached[p.id]
+      const cfg = config.providers[p.id]
+      // A signed-out provider must never resurrect cached windows.
+      if (p.hasCredentials && !(await p.hasCredentials(cfg))) {
+        if (cached[p.id]?.length) {
+          void setCached((draft) => {
+            draft[p.id] = []
+          })
+        }
+        continue
+      }
+      // Cached windows obey the current config and expiry, like fresh ones.
+      const windows = cached[p.id]?.filter((w) => cfg.show[w.category] && w.resetsAt > Date.now())
       if (windows?.length) seed[p.id] = windows.map((w) => ({ ...w }))
     }
     const [byProvider, setByProvider] = createSignal<Record<string, UsageWindow[]>>(seed)
@@ -491,6 +629,15 @@ export default Plugin.define({
       const cfg = config.providers[p.id]
       const poll = async () => {
         if (disposed) return
+        if (p.hasCredentials && !(await p.hasCredentials(cfg))) {
+          // Signed out: drop cached windows instead of showing stale values.
+          setByProvider((prev) => ({ ...prev, [p.id]: [] }))
+          void setCached((draft) => {
+            draft[p.id] = []
+          })
+          later(poll, POLL_MS)
+          return
+        }
         // Fetch usage and status concurrently; status pages are CDN-backed and
         // never throttle, so we poll them on the same cadence as usage.
         const statusP = config.showStatus && p.statusUrl ? fetchStatus(p.statusUrl) : null

@@ -6,8 +6,8 @@ An AI subscription usage gauge for the [opencode](https://opencode.ai) TUI.
 
 Shows how much of your coding-plan quota you've used and how long until it
 resets, in a full-width row just below the session footer. Supports
-**Claude Pro/Max** and **ChatGPT Plus/Pro (Codex)** — each optional, each
-with per-window toggles.
+**OpenCode Go/Plus**, **Claude Pro/Max** and **ChatGPT Plus/Pro (Codex)** —
+each optional, each with per-window toggles.
 
 ```
 ┌─ opencode session ────────────────────────────────────┐
@@ -23,6 +23,7 @@ With multiple windows/providers enabled:
 
 ```
 cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h   oai ▓░░░░ 12% · 3h 4m
+ocg ░░░░░ 2% · 6d 9h  month ▓░░░░ 38% · 9d 21h
 ```
 
 When a provider's public status page reports an active incident, a colored
@@ -42,7 +43,7 @@ When a provider's public status page reports an active incident, a colored
 - Last known values are cached, so the bar appears instantly on restart.
 - Providers hide silently when credentials are missing/expired or a fetch
   fails; the whole row hides when nothing is available.
-- Provider prefixes (`cld`/`oai`) appear only when two or more providers
+- Provider prefixes (`cld`/`oai`/`ocg`) appear only when two or more providers
   are visible; window labels (`5h`/`7d`/…) appear only when a provider shows
   two or more windows.
 
@@ -83,9 +84,9 @@ straight at a checkout — its root `tui.tsx` forwards to `src/index.tsx`:
 ## Configuration
 
 On first run the plugin creates `~/.config/opencode/usage-bar.toml` with
-commented defaults (Claude enabled, 5-hour window only — matching the
-screenshot above). Edit it and restart opencode; the config is read once at
-startup.
+commented defaults (Claude and OpenCode Go enabled, 5-hour window only for
+Claude — matching the screenshot above). Edit it and restart opencode; the
+config is read once at startup.
 
 ```toml
 [ui]
@@ -105,7 +106,18 @@ enabled = false       # ChatGPT Plus/Pro via the Codex CLI login
 show_5h = true
 show_7d = false
 # codex_auth_path = "~/.codex/auth.json"
+
+[opencode]
+enabled = true        # OpenCode Go/Plus via the Console account login (/connect)
+show_5h = true        # rolling 5-hour window
+show_7d = true        # UTC calendar week
+show_month = true     # paid billing period
 ```
+
+To enable the OpenCode Go/Plus provider, connect your Console account once —
+`/connect` in the TUI, then **OpenCode Console → OpenCode Console account**.
+The plugin reads that OAuth credential (refresh tokens are never touched) and
+calls the same `/api/go/status` endpoint the Console `Go` page uses.
 
 ## Providers & data sources
 
@@ -113,17 +125,21 @@ show_7d = false
 |---|---|---|---|---|
 | `anthropic` | Claude Code's `~/.claude/.credentials.json` → opencode's auth store | `api.anthropic.com/api/oauth/usage` | `status.anthropic.com` | 5h session, 7d all-models, 7d per-model |
 | `openai` | Codex CLI's `~/.codex/auth.json` → opencode's auth store | `chatgpt.com/backend-api/wham/usage` | `status.openai.com` | 5h session, 7d weekly |
+| `opencode` | opencode's Console account login (`/connect`); v2 credential store → legacy auth store | `opencode.ai/console/api/go/status` | — | 5h rolling, UTC week, paid period |
 
-If you log in through opencode itself (`opencode auth login`), everything works
-with zero extra setup — the plugin falls back to opencode's own auth store
-(`<data dir>/auth.json`, e.g. `~/.local/share/opencode/auth.json`). All
-credential access is **read-only**; expired tokens simply hide the provider
-until the owning CLI refreshes them.
+If you log in through opencode itself (`opencode auth login` / `/connect`),
+everything works with zero extra setup — the plugin falls back to opencode's
+own auth store (`<data dir>/auth.json`, e.g.
+`~/.local/share/opencode/auth.json`). All credential access is **read-only**;
+expired tokens simply hide the provider until the owning CLI refreshes them.
+The OpenCode Go credential is read from opencode's v2 credential store
+(`<data dir>/opencode.db`, table `credential`) because that is where v2 keeps
+account connections.
 
 **Security note:** each credential is read from disk/env and sent **only** to
 its own provider's API host, over HTTPS, to fetch usage numbers. The status
 check hits each vendor's public status page with no credentials at all.
-Nothing else is read, stored, or transmitted. Both usage endpoints are
+Nothing else is read, stored, or transmitted. All usage endpoints are
 undocumented/internal (the same ones the vendors' own tooling uses) and may
 change without notice.
 
@@ -143,6 +159,8 @@ automatically).
 - GLM coding plan (z.ai) provider.
 - Anthropic/OpenAI OAuth token auto-refresh (both credential files include a
   refresh token; for now the respective CLIs keep them fresh).
+- OpenCode Go token auto-refresh: the Console device login lasts ~30 days;
+  until the plugin refreshes it, reconnect with `/connect` when it expires.
 
 ## Requirements
 

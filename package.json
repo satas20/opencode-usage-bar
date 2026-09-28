@@ -1,11 +1,11 @@
 {
   "name": "@satas/opencode-usage-bar",
   "version": "0.3.0",
-  "description": "AI subscription usage gauge with provider status for the opencode TUI (Claude Pro/Max, ChatGPT Plus/Pro) — shows ▓▓▓░░░ 36% · 0h 39m and a ! marker during incidents.",
+  "description": "AI subscription usage gauge with provider status for the opencode TUI (OpenCode Go/Plus, Claude Pro/Max, ChatGPT Plus/Pro) — shows ▓▓▓░░░ 36% · 0h 39m and a ! marker during incidents.",
   "type": "module",
   "license": "MIT",
   "author": "satas20 <ata.ayyildiz@outlook.com>",
-  "keywords": ["opencode", "tui", "plugin", "usage", "quota", "claude", "chatgpt", "codex", "status", "statusbar", "incident"],
+  "keywords": ["opencode", "opencode-go", "tui", "plugin", "usage", "quota", "claude", "chatgpt", "codex", "status", "statusbar", "incident"],
   "homepage": "https://github.com/satas20/opencode-usage-bar",
   "repository": {
     "type": "git",
