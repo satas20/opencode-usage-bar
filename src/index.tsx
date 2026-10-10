@@ -1,16 +1,26 @@
 /**
  * usage-bar — AI subscription usage gauge for the opencode TUI.
  *
- * Renders a compact usage strip in the `app_bottom` slot — a full-width row
- * just below the session footer:
+ * Renders a compact usage gauge:
+ *
+ *   - in the prompt footer row (`prompt.footer.status`), next to the location,
+ *     context tokens/cost and shortcut hints — compact by default, expanding
+ *     to every enabled window when the footer reports room for details; and/or
+ *   - as a right-aligned strip on the bottom row of the interface (`app`).
+ *
+ * Which surfaces are used is set by `placement` in the config (default: both).
  *
  *   ▓▓▓▓░░ 65% · 0h 11m                                  (one window)
  *   cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h   oai ▓░░░░ 12% · 3h 4m
  *   ! cld ▓▓▓▓░ 65% · 0h 11m                             (anthropic incident)
  *
+ * In the prompt footer the gauge shows the most constrained window per
+ * provider and only expands to the full list when the estimate fits.
+ *
  * Providers:
  *   anthropic — Claude Pro/Max via the OAuth token in ~/.claude/.credentials.json
  *   openai    — ChatGPT Plus/Pro via the Codex CLI login in ~/.codex/auth.json
+ *   opencode  — OpenCode Go/Plus via the Console account login (`/connect`)
  *
  * When a provider's public status page reports an incident, a colored `!`
  * marker appears next to its prefix (red = major/critical, amber = minor,
@@ -21,16 +31,17 @@
  * commented defaults on first run; read once at startup). Tokens/keys are
  * only ever sent to their own provider's API host.
  *
- * Loaded via tui.json, e.g.:
- *   { "plugin": ["@satas/opencode-usage-bar"] }      // published npm package
- *   { "plugin": ["/abs/path/to/src/index.tsx"] }     // local file (no build)
+ * Loaded via cli.json (opencode v2), e.g.:
+ *   { "plugins": ["@satas/opencode-usage-bar"] }        // published npm package
+ *   { "plugins": ["/abs/path/to/opencode-usage-bar"] }  // local checkout (no build)
  */
-import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { Plugin, usePlugin } from "@opencode/plugin/tui"
 import { createMemo, createSignal, For, Show } from "solid-js"
 import { readFile, writeFile, mkdir } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { Buffer } from "node:buffer"
+import { Database } from "bun:sqlite"
 
 const POLL_MS = 120_000
 const FETCH_TIMEOUT_MS = 10_000
@@ -41,7 +52,7 @@ const CONFIG_FILE = "usage-bar.toml"
 // ---------------------------------------------------------------------------
 
 /** Which quota window a value belongs to; toggled per provider in config. */
-type WindowCategory = "5h" | "7d" | "model"
+type WindowCategory = "5h" | "7d" | "model" | "month"
 
 /** Provider health from the vendor's public status page (Statuspage schema). */
 type StatusIndicator = "none" | "minor" | "major" | "critical" | "maintenance"
@@ -56,7 +67,7 @@ type UsageWindow = {
   resetsAt: number
 }
 
-type ProviderId = "anthropic" | "openai"
+type ProviderId = "anthropic" | "openai" | "opencode"
 
 type ProviderConfig = {
   enabled: boolean
@@ -67,10 +78,14 @@ type ProviderConfig = {
   codexAuthPath?: string
 }
 
+/** Where the gauge is rendered: the prompt footer row, the bottom strip, or both. */
+type UsagePlacement = "footer" | "app" | "both"
+
 type UsageBarConfig = {
   showBars: boolean
   showStatus: boolean
   barWidth?: number
+  placement: UsagePlacement
   providers: Record<ProviderId, ProviderConfig>
 }
 
@@ -80,6 +95,10 @@ type Provider = {
   short: string
   /** vendor status page JSON endpoint (Statuspage `status.json`); optional */
   statusUrl?: string
+  /** Distinguishes "signed out" (cached windows are dropped and the provider
+   *  hides) from a transient fetch failure (last known values are kept).
+   *  Providers without this hook always keep their cache on failure. */
+  hasCredentials?(cfg: ProviderConfig): Promise<boolean>
   fetchUsage(cfg: ProviderConfig): Promise<UsageWindow[] | null>
 }
 
@@ -91,6 +110,20 @@ function expandTilde(p: string) {
   return p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p
 }
 
+/** opencode's global config directory (XDG-aware, matching opencode itself). */
+function configDir() {
+  return process.env.XDG_CONFIG_HOME
+    ? join(process.env.XDG_CONFIG_HOME, "opencode")
+    : join(homedir(), ".config", "opencode")
+}
+
+/** opencode's global data directory (XDG-aware, matching opencode itself). */
+function stateDir() {
+  return process.env.XDG_DATA_HOME
+    ? join(process.env.XDG_DATA_HOME, "opencode")
+    : join(homedir(), ".local", "share", "opencode")
+}
+
 function fmtDuration(ms: number) {
   const totalMinutes = Math.max(0, Math.ceil(ms / 60_000))
   const days = Math.floor(totalMinutes / 1440)
@@ -98,6 +131,76 @@ function fmtDuration(ms: number) {
   const minutes = totalMinutes % 60
   if (days > 0) return `${days}d ${hours}h`
   return `${hours}h ${minutes}m`
+}
+
+/** A provider's gauge row: every enabled window, plus the subset rendered. */
+type UsageGroup = {
+  short: string
+  status: StatusIndicator
+  /** Enabled windows after config filtering and expiry checks. */
+  windows: UsageWindow[]
+  /** The windows actually rendered — all of them, or one per provider in compact mode. */
+  shown: UsageWindow[]
+}
+
+/** 0–100, rounded and clamped — the percentage the gauge prints. */
+function usagePct(w: UsageWindow) {
+  return Math.min(100, Math.max(0, Math.round(w.percent)))
+}
+
+/** The bottom strip has the row to itself and only needs its own padding. */
+const BAR_RESERVE = 2
+
+/** Cells reserved for everything else on the prompt footer row: the
+ *  agent/model chips, the location and the built-in context/cost and shortcut
+ *  cluster. The full list only expands when it fits in what is left; the
+ *  compact form reserves less and hides when even that does not fit. Sessions
+ *  carry the context/cost readout, so they need more room than the home
+ *  prompt. */
+const FOOTER_RESERVE = { full: 100, compactSession: 60, compactHome: 50 }
+
+/** The home prompt is capped at this many columns regardless of the terminal. */
+const HOME_PROMPT_MAX = 75
+
+/** The session sidebar claims this many columns, and only appears while the
+ *  terminal is wider than SIDEBAR_MIN_WIDTH. */
+const SIDEBAR_WIDTH = 42
+const SIDEBAR_MIN_WIDTH = 120
+
+/** Estimated cell width of the gauge for the given groups. Every glyph the
+ *  gauge prints is single-width, so a code-point count matches the layout.
+ *  Used to decide between the full and compact forms, and whether the
+ *  contribution has room to render at all. */
+function gaugeWidth(
+  groups: UsageGroup[],
+  opts: {
+    multiProvider: boolean
+    showBars: boolean
+    showStatus: boolean
+    barWidth: number
+    now: number
+  },
+): number {
+  const gapRoot = 3
+  const gapGroup = 2
+  const gapWindow = 1
+  let total = 0
+  groups.forEach((g, index) => {
+    if (index > 0) total += gapRoot
+    const parts: number[] = []
+    if (opts.showStatus && g.status !== "none") parts.push(1)
+    if (opts.multiProvider) parts.push(g.short.length)
+    for (const w of g.shown) {
+      const cells: number[] = []
+      if (g.windows.length >= 2) cells.push(w.label.length)
+      if (opts.showBars) cells.push(opts.barWidth)
+      cells.push(`${usagePct(w)}%`.length)
+      cells.push(`· ${fmtDuration(w.resetsAt - opts.now)}`.length)
+      parts.push(cells.reduce((sum, n) => sum + n, 0) + gapWindow * (cells.length - 1))
+    }
+    total += parts.reduce((sum, n) => sum + n, 0) + gapGroup * Math.max(0, parts.length - 1)
+  })
+  return total
 }
 
 /** Decode a JWT's `exp` claim (unix seconds) without verifying. 0 on failure. */
@@ -152,9 +255,8 @@ type OpencodeAuthEntry = {
   accountId?: string
 }
 
-/** Set from `api.state.path.state` at startup; default matches opencode's
- *  XDG data dir. */
-let opencodeAuthFile = join(homedir(), ".local", "share", "opencode", "auth.json")
+/** opencode's own auth store (`opencode auth login`); XDG-aware default. */
+let opencodeAuthFile = join(stateDir(), "auth.json")
 
 /** Read a provider's entry from opencode's own auth store
  *  (`opencode auth login`). Returns null when missing/unreadable. */
@@ -172,6 +274,71 @@ async function opencodeAuth(...ids: string[]): Promise<OpencodeAuthEntry | null>
   } catch {
     return null
   }
+}
+
+// ---------------------------------------------------------------------------
+// OpenCode Console account (OpenCode Go / Go Plus)
+// ---------------------------------------------------------------------------
+
+/** Console base URL; the Go status endpoint lives at `<server>/api/go/status`. */
+const CONSOLE_SERVER = "https://opencode.ai/console"
+
+type ConsoleCredential = {
+  server: string
+  access: string
+  /** epoch ms; 0 = no expiry */
+  expires: number
+}
+
+/** Read the active `opencode` (OpenCode Console) OAuth credential written by
+ *  the Console account device login (`/connect`). v2 keeps credentials in its
+ *  SQLite store; auth.json remains as the legacy fallback. Read-only — the
+ *  token is never refreshed or rewritten; when it is expired the provider
+ *  simply hides until the account is reconnected. */
+async function opencodeConsoleCredential(): Promise<ConsoleCredential | null> {
+  try {
+    const db = new Database(join(stateDir(), "opencode.db"), { readonly: true })
+    try {
+      const row = db
+        .query<{ value?: string }>(
+          "select value from credential where integration_id = 'opencode' and active = 1 order by time_updated desc limit 1",
+        )
+        .get()
+      if (row?.value) {
+        const cred = JSON.parse(row.value) as {
+          type?: string
+          access?: string
+          expires?: number
+          metadata?: { server?: string }
+        }
+        if (cred.type === "oauth" && cred.access && !(cred.expires && Date.now() >= cred.expires)) {
+          return {
+            server: cred.metadata?.server ?? CONSOLE_SERVER,
+            access: cred.access,
+            expires: typeof cred.expires === "number" ? cred.expires : 0,
+          }
+        }
+      }
+    } finally {
+      db.close()
+    }
+  } catch {
+    // fall through to the legacy auth store
+  }
+
+  const entry = await opencodeAuth("opencode")
+  if (entry?.access && !(entry.expires && Date.now() >= entry.expires)) {
+    return { server: CONSOLE_SERVER, access: entry.access, expires: entry.expires ?? 0 }
+  }
+  return null
+}
+
+/** One quota window on the Go subscription. Money is microcents in strings. */
+type GoMeter = {
+  startsAt?: string
+  resetsAt?: string
+  limitMicroCents?: string | number
+  usedMicroCents?: string | number
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +489,54 @@ function parseWhamWindow(
   return { category, label: category, percent: w.used_percent, resetsAt }
 }
 
-const providers: Provider[] = [anthropicProvider, openaiProvider]
+/** OpenCode Go / Go Plus — the subscription shown on the Console `Go` page.
+ *  Reads the Console account credential and calls the same status endpoint
+ *  the web UI uses; money is microcents, so `percent = used / limit`. */
+const opencodeProvider: Provider = {
+  id: "opencode",
+  short: "ocg",
+  async hasCredentials() {
+    return (await opencodeConsoleCredential()) !== null
+  },
+  async fetchUsage() {
+    const cred = await opencodeConsoleCredential()
+    if (!cred) return null
+
+    const data = (await fetchJson(`${cred.server}/api/go/status`, {
+      authorization: `Bearer ${cred.access}`,
+      accept: "application/json",
+    })) as {
+      access?: {
+        meters?: { fiveHour?: GoMeter; week?: GoMeter; month?: GoMeter } | null
+      } | null
+    } | null
+    const meters = data?.access?.meters
+    if (!meters) return null
+
+    const windows: UsageWindow[] = []
+    const add = (category: WindowCategory, meter: GoMeter | undefined) => {
+      if (!meter) return
+      const limit = Number(meter.limitMicroCents)
+      const used = Number(meter.usedMicroCents)
+      const resetsAt = typeof meter.resetsAt === "string" ? Date.parse(meter.resetsAt) : NaN
+      if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(used) || Number.isNaN(resetsAt))
+        return
+      // Same rounding as the Console web UI.
+      windows.push({
+        category,
+        label: category,
+        percent: Math.round((used / limit) * 100),
+        resetsAt,
+      })
+    }
+    add("5h", meters.fiveHour)
+    add("7d", meters.week)
+    add("month", meters.month)
+    return windows.length > 0 ? windows : null
+  },
+}
+
+const providers: Provider[] = [anthropicProvider, openaiProvider, opencodeProvider]
 
 // ---------------------------------------------------------------------------
 // Config
@@ -334,6 +548,7 @@ const DEFAULT_TOML = `# opencode-usage-bar configuration
 [ui]
 show_bars = true      # render ▓▓░░ mini-bars (false = text only)
 show_status = true    # show a ! marker next to a provider during incidents
+placement = "both"    # footer (prompt footer), app (bottom strip), or both
 # bar_width = 6       # override bar width (default: 6 for a single window, 5 otherwise)
 
 [anthropic]
@@ -348,6 +563,12 @@ enabled = false       # ChatGPT Plus/Pro via the Codex CLI login
 show_5h = true
 show_7d = false
 # codex_auth_path = "~/.codex/auth.json"
+
+[opencode]
+enabled = true        # OpenCode Go/Plus via the Console account login (/connect)
+show_5h = true        # rolling 5-hour window
+show_7d = true        # UTC calendar week
+show_month = true     # paid billing period
 `
 
 function defaultConfig(): UsageBarConfig {
@@ -355,14 +576,17 @@ function defaultConfig(): UsageBarConfig {
     "5h": true,
     "7d": false,
     model: false,
+    month: false,
     ...over,
   })
   return {
     showBars: true,
     showStatus: true,
+    placement: "both",
     providers: {
       anthropic: { enabled: true, show: show() },
       openai: { enabled: false, show: show() },
+      opencode: { enabled: true, show: show({ "7d": true, month: true }) },
     },
   }
 }
@@ -390,17 +614,21 @@ function parseConfig(raw: string): UsageBarConfig {
   const ui = asTable(root["ui"])
   cfg.showBars = bool(ui["show_bars"], cfg.showBars)
   cfg.showStatus = bool(ui["show_status"], cfg.showStatus)
+  const placement = str(ui["placement"])
+  if (placement === "footer" || placement === "app" || placement === "both")
+    cfg.placement = placement
   const rawWidth = ui["bar_width"]
   if (typeof rawWidth === "number" && Number.isFinite(rawWidth) && rawWidth >= 1)
     cfg.barWidth = Math.min(40, Math.floor(rawWidth))
 
-  for (const id of ["anthropic", "openai"] as ProviderId[]) {
+  for (const id of ["anthropic", "openai", "opencode"] as ProviderId[]) {
     const t = asTable(root[id])
     const p = cfg.providers[id]
     p.enabled = bool(t["enabled"], p.enabled)
     p.show["5h"] = bool(t["show_5h"], p.show["5h"])
     p.show["7d"] = bool(t["show_7d"], p.show["7d"])
     p.show.model = bool(t["show_model"], p.show.model)
+    p.show.month = bool(t["show_month"], p.show.month)
     p.credentialsPath = str(t["credentials_path"])
     p.codexAuthPath = str(t["codex_auth_path"])
   }
@@ -410,13 +638,7 @@ function parseConfig(raw: string): UsageBarConfig {
 /** Load `<config dir>/usage-bar.toml`, creating it with commented defaults on
  *  first run. Any failure falls back to defaults without touching an existing
  *  file. */
-async function loadConfig(configPath: string | undefined): Promise<UsageBarConfig> {
-  const dir =
-    configPath && !configPath.endsWith(".json")
-      ? configPath
-      : configPath
-        ? dirname(configPath)
-        : join(homedir(), ".config", "opencode")
+async function loadConfig(dir: string): Promise<UsageBarConfig> {
   const file = join(dir, CONFIG_FILE)
 
   try {
@@ -443,133 +665,275 @@ async function loadConfig(configPath: string | undefined): Promise<UsageBarConfi
 // Plugin
 // ---------------------------------------------------------------------------
 
-const tui: TuiPlugin = async (api) => {
-  const config = await loadConfig(api.state.path?.config)
-  if (api.state.path?.state) opencodeAuthFile = join(api.state.path.state, "auth.json")
+export default Plugin.define({
+  id: "opencode-usage-bar",
+  async setup(context) {
+    opencodeAuthFile = join(stateDir(), "auth.json")
+    const config = await loadConfig(configDir())
 
-  const enabled = providers.filter((p) => config.providers[p.id].enabled)
-  if (enabled.length === 0) return // nothing to poll or render
+    const enabled = providers.filter((p) => config.providers[p.id].enabled)
+    if (enabled.length === 0) return // nothing to poll or render
 
-  const seed: Record<string, UsageWindow[]> = {}
-  for (const p of enabled) {
-    const cached = api.kv.get<UsageWindow[] | undefined>(`usage-bar.${p.id}.windows`, undefined)
-    if (cached) seed[p.id] = cached
-  }
-  const [byProvider, setByProvider] = createSignal<Record<string, UsageWindow[]>>(seed)
-  // Status is deliberately not cached across restarts: incidents are
-  // short-lived, and the first poll lands seconds after startup anyway.
-  const [byStatus, setByStatus] = createSignal<Record<string, StatusIndicator>>({})
-  const [now, setNow] = createSignal(Date.now())
+    // Terminal width drives the adaptive detail level; the home prompt caps
+    // its own width and the session sidebar takes a fixed share.
+    const [termWidth, setTermWidth] = createSignal(context.renderer.terminalWidth)
+    const onResize = () => setTermWidth(context.renderer.terminalWidth)
+    context.renderer.on("resize", onResize)
 
-  setInterval(() => setNow(Date.now()), 1_000)
+    // Durable, plugin-scoped storage (survives restarts, synced across TUIs).
+    const [cached, setCached] = context.storage.store<Record<string, UsageWindow[]>>("windows", {
+      initial: {},
+    })
 
-  for (const p of enabled) {
-    const cfg = config.providers[p.id]
-    const poll = async () => {
-      // Fetch usage and status concurrently; status pages are CDN-backed and
-      // never throttle, so we poll them on the same cadence as usage.
-      const statusP = config.showStatus && p.statusUrl ? fetchStatus(p.statusUrl) : null
-      const [all, status] = await Promise.all([p.fetchUsage(cfg), statusP])
-      if (all) {
-        const windows = all.filter((w) => cfg.show[w.category] && w.resetsAt > Date.now())
-        setByProvider((prev) => ({ ...prev, [p.id]: windows }))
-        api.kv.set(`usage-bar.${p.id}.windows`, windows)
+    const seed: Record<string, UsageWindow[]> = {}
+    for (const p of enabled) {
+      const cfg = config.providers[p.id]
+      // A signed-out provider must never resurrect cached windows.
+      if (p.hasCredentials && !(await p.hasCredentials(cfg))) {
+        if (cached[p.id]?.length) {
+          void setCached((draft) => {
+            draft[p.id] = []
+          })
+        }
+        continue
       }
-      // `null` means the status fetch failed — keep the last known indicator.
-      if (status !== null) setByStatus((prev) => ({ ...prev, [p.id]: status }))
-      // Back off when the usage fetch failed (e.g. 429 — these endpoints throttle).
-      setTimeout(poll, all ? POLL_MS : POLL_MS * 3)
+      // Cached windows obey the current config and expiry, like fresh ones.
+      const windows = cached[p.id]?.filter((w) => cfg.show[w.category] && w.resetsAt > Date.now())
+      if (windows?.length) seed[p.id] = windows.map((w) => ({ ...w }))
     }
-    void poll()
-  }
+    const [byProvider, setByProvider] = createSignal<Record<string, UsageWindow[]>>(seed)
+    // Status is deliberately not cached across restarts: incidents are
+    // short-lived, and the first poll lands seconds after startup anyway.
+    const [byStatus, setByStatus] = createSignal<Record<string, StatusIndicator>>({})
+    const [now, setNow] = createSignal(Date.now())
 
-  api.slots.register({
-    order: 60,
-    slots: {
-      // `app_bottom` renders as a full-width row below the session footer.
-      app_bottom() {
-        const theme = () => api.theme.current
+    let disposed = false
+    const timers = new Set<ReturnType<typeof setTimeout>>()
+    const later = (fn: () => void, ms: number) => {
+      const timer = setTimeout(() => {
+        timers.delete(timer)
+        fn()
+      }, ms)
+      timers.add(timer)
+    }
 
-        type Group = { short: string; status: StatusIndicator; windows: UsageWindow[] }
-        const groups = createMemo<Group[]>(() => {
-          const map = byProvider()
-          const statusMap = byStatus()
-          const out: Group[] = []
-          for (const p of enabled) {
-            // Drop windows that have reset since the last poll.
-            const windows = (map[p.id] ?? []).filter((w) => w.resetsAt > now())
-            if (windows.length > 0)
-              out.push({ short: p.short, status: statusMap[p.id] ?? "none", windows })
-          }
-          return out
+    const ticker = setInterval(() => setNow(Date.now()), 1_000)
+
+    for (const p of enabled) {
+      const cfg = config.providers[p.id]
+      const poll = async () => {
+        if (disposed) return
+        if (p.hasCredentials && !(await p.hasCredentials(cfg))) {
+          // Signed out: drop cached windows instead of showing stale values.
+          setByProvider((prev) => ({ ...prev, [p.id]: [] }))
+          void setCached((draft) => {
+            draft[p.id] = []
+          })
+          later(poll, POLL_MS)
+          return
+        }
+        // Fetch usage and status concurrently; status pages are CDN-backed and
+        // never throttle, so we poll them on the same cadence as usage.
+        const statusP = config.showStatus && p.statusUrl ? fetchStatus(p.statusUrl) : null
+        const [all, status] = await Promise.all([p.fetchUsage(cfg), statusP])
+        if (disposed) return
+        if (all) {
+          const windows = all.filter((w) => cfg.show[w.category] && w.resetsAt > Date.now())
+          setByProvider((prev) => ({ ...prev, [p.id]: windows }))
+          void setCached((draft) => {
+            draft[p.id] = windows
+          })
+        }
+        // `null` means the status fetch failed — keep the last known indicator.
+        if (status !== null) setByStatus((prev) => ({ ...prev, [p.id]: status }))
+        // Back off when the usage fetch failed (e.g. 429 — these endpoints throttle).
+        later(poll, all ? POLL_MS : POLL_MS * 3)
+      }
+      void poll()
+    }
+
+    function UsageBar(props: {
+      /** Prompt footer input: true when the host has room for details. */
+      showDetails?: () => boolean
+      /** Active session, or undefined on the home prompt. */
+      sessionID?: () => string | undefined
+      /** Bottom status-bar treatment: full width, right-aligned, raised surface. */
+      bar?: boolean
+    }) {
+      const theme = usePlugin().theme
+
+      const groups = createMemo<UsageGroup[]>(() => {
+        const map = byProvider()
+        const statusMap = byStatus()
+        const out: UsageGroup[] = []
+        for (const p of enabled) {
+          // Drop windows that have reset since the last poll.
+          const windows = (map[p.id] ?? []).filter((w) => w.resetsAt > now())
+          if (windows.length > 0)
+            out.push({ short: p.short, status: statusMap[p.id] ?? "none", windows, shown: windows })
+        }
+        return out
+      })
+      const multiProvider = createMemo(() => groups().length >= 2)
+
+      // Compact keeps the most constrained window per provider; ties go to the
+      // window resetting first.
+      const compact = createMemo<UsageGroup[]>(() =>
+        groups().map((g) => {
+          const top = g.windows.reduce((a, b) =>
+            usagePct(b) > usagePct(a) || (usagePct(b) === usagePct(a) && b.resetsAt < a.resetsAt)
+              ? b
+              : a,
+          )
+          return { ...g, shown: [top] }
+        }),
+      )
+
+      // Cells the gauge may occupy. The home prompt is capped and the session
+      // sidebar (auto) takes a fixed column, so the terminal width alone is not
+      // the answer; the rest of the prompt footer row keeps its own reserve.
+      const budget = (kind: "full" | "compact") => {
+        const term = termWidth()
+        if (props.bar) return Math.max(0, term - BAR_RESERVE)
+        const session = !!props.sessionID?.()
+        const base = session
+          ? term - (term > SIDEBAR_MIN_WIDTH ? SIDEBAR_WIDTH : 0)
+          : Math.min(term, HOME_PROMPT_MAX)
+        const reserve =
+          kind === "full"
+            ? FOOTER_RESERVE.full
+            : session
+              ? FOOTER_RESERVE.compactSession
+              : FOOTER_RESERVE.compactHome
+        return Math.max(0, base - reserve)
+      }
+      const estimate = (list: UsageGroup[], barCells: number) =>
+        gaugeWidth(list, {
+          multiProvider: multiProvider(),
+          showBars: config.showBars,
+          showStatus: config.showStatus,
+          barWidth: barCells,
+          now: now(),
         })
-        const totalWindows = createMemo(() =>
-          groups().reduce((sum, g) => sum + g.windows.length, 0),
-        )
-        const barWidth = createMemo(() => config.barWidth ?? (totalWindows() === 1 ? 6 : 5))
-        const multiProvider = createMemo(() => groups().length >= 2)
+      const windowsIn = (list: UsageGroup[]) =>
+        list.reduce((sum, g) => sum + g.shown.length, 0)
+      const cellCount = (list: UsageGroup[]) => config.barWidth ?? (windowsIn(list) === 1 ? 6 : 5)
 
-        const pctOf = (w: UsageWindow) => Math.min(100, Math.max(0, Math.round(w.percent)))
-        const filledOf = (w: UsageWindow) =>
-          Math.min(barWidth(), Math.max(0, Math.round((pctOf(w) / 100) * barWidth())))
-        const colorOf = (w: UsageWindow) => {
-          const t = theme()
-          const pct = pctOf(w)
-          if (pct > 85) return t.error
-          if (pct >= 50) return t.warning
-          return t.success
-        }
-        // Status marker color: red for severe incidents, amber for minor,
-        // cyan for scheduled maintenance.
-        const statusColor = (s: StatusIndicator) => {
-          const t = theme()
-          if (s === "critical" || s === "major") return t.error
-          if (s === "minor") return t.warning
-          return t.info
-        }
+      // Full only when the host reports room and the estimate fits the budget;
+      // otherwise the compact form shows, and when even that does not fit the
+      // contribution hides rather than clipping mid-text.
+      const showFull = createMemo(
+        () => !!props.showDetails?.() && estimate(groups(), cellCount(groups())) <= budget("full"),
+      )
+      const visible = createMemo(
+        () =>
+          groups().length > 0 &&
+          (showFull() || estimate(compact(), cellCount(compact())) <= budget("compact")),
+      )
+      const displayed = createMemo(() => (showFull() ? groups() : compact()))
+      const barWidth = createMemo(() => cellCount(displayed()))
 
-        return (
-          <Show when={groups().length > 0}>
-            <box flexDirection="row" gap={3} alignItems="center" width="100%" paddingLeft={1}>
-              <For each={groups()}>
-                {(g) => (
-                  <box flexDirection="row" gap={2} alignItems="center" flexShrink={0}>
-                    <Show when={config.showStatus && g.status !== "none"}>
-                      <text fg={statusColor(g.status)}>!</text>
-                    </Show>
-                    <Show when={multiProvider()}>
-                      <text fg={theme().textMuted}>{g.short}</text>
-                    </Show>
-                    <For each={g.windows}>
-                      {(w) => (
-                        <box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
-                          <Show when={g.windows.length >= 2}>
-                            <text fg={theme().textMuted}>{w.label}</text>
-                          </Show>
-                          <Show when={config.showBars}>
-                            <box flexDirection="row">
+      const filledOf = (w: UsageWindow) =>
+        Math.min(barWidth(), Math.max(0, Math.round((usagePct(w) / 100) * barWidth())))
+      const colorOf = (w: UsageWindow) => {
+        const pct = usagePct(w)
+        if (pct > 85) return theme.text.feedback.error.base
+        if (pct >= 50) return theme.text.feedback.warning.base
+        return theme.text.feedback.success.base
+      }
+      // Status marker color: red for severe incidents, amber for minor,
+      // cyan for scheduled maintenance.
+      const statusColor = (s: StatusIndicator) => {
+        if (s === "critical" || s === "major") return theme.text.feedback.error.base
+        if (s === "minor") return theme.text.feedback.warning.base
+        return theme.text.feedback.info.base
+      }
+
+      return (
+        <Show when={visible()}>
+          {/* One line, always: the gauge keeps its content width and the
+              location yields (truncates) when the row is tight, while the
+              bottom strip is pinned to the full width. */}
+          <box
+            flexDirection="row"
+            gap={3}
+            alignItems="center"
+            height={1}
+            width={props.bar ? "100%" : undefined}
+            justifyContent="flex-end"
+            paddingRight={props.bar ? BAR_RESERVE : 0}
+            flexShrink={0}
+            minWidth={0}
+            overflow="hidden"
+            backgroundColor={props.bar ? theme.background.raised.base : undefined}
+          >
+            <For each={displayed()}>
+              {(g) => (
+                <box flexDirection="row" gap={2} alignItems="center" flexShrink={0}>
+                  <Show when={config.showStatus && g.status !== "none"}>
+                    <text fg={statusColor(g.status)}>!</text>
+                  </Show>
+                  <Show when={multiProvider()}>
+                    <text fg={theme.text.muted}>{g.short}</text>
+                  </Show>
+                  <For each={g.shown}>
+                    {(w) => (
+                      <box flexDirection="row" gap={1} alignItems="center" flexShrink={0}>
+                        <Show when={g.windows.length >= 2}>
+                          <text fg={theme.text.muted}>{w.label}</text>
+                        </Show>
+                        <Show when={config.showBars}>
+                          <box flexDirection="row">
+                            <Show when={filledOf(w) > 0}>
                               <text fg={colorOf(w)}>{"▓".repeat(filledOf(w))}</text>
-                              <text fg={theme().textMuted}>
-                                {"░".repeat(barWidth() - filledOf(w))}
-                              </text>
-                            </box>
-                          </Show>
-                          <text fg={theme().text}>{pctOf(w)}%</text>
-                          <text fg={theme().textMuted}>· {fmtDuration(w.resetsAt - now())}</text>
-                        </box>
-                      )}
-                    </For>
-                  </box>
-                )}
-              </For>
-            </box>
-          </Show>
-        )
-      },
-    },
-  })
-}
+                            </Show>
+                            <text fg={theme.text.muted}>
+                              {"░".repeat(barWidth() - filledOf(w))}
+                            </text>
+                          </box>
+                        </Show>
+                        <text fg={theme.text.base}>{usagePct(w)}%</text>
+                        <text fg={theme.text.muted}>· {fmtDuration(w.resetsAt - now())}</text>
+                      </box>
+                    )}
+                  </For>
+                </box>
+              )}
+            </For>
+          </box>
+        </Show>
+      )
+    }
 
-const plugin = { id: "opencode-usage-bar", tui } satisfies TuiPluginModule
+    // The prompt footer row already carries the spinner, location, context
+    // tokens/cost and shortcut hints, so the gauge belongs there: compact by
+    // default, expanding when the footer reports room for details.
+    if (config.placement === "footer" || config.placement === "both") {
+      context.ui.slot({
+        append: "prompt.footer.status",
+        render: (input) => (
+          <UsageBar showDetails={() => input.showDetails} sessionID={() => input.sessionID} />
+        ),
+      })
+    }
 
-export default plugin
+    // The bottom strip (the v2 equivalent of v1's `app_bottom` slot) has the
+    // row to itself, so it leans to the full list; right-aligned on the raised
+    // surface so it reads as a status bar instead of a stray line below the
+    // interface.
+    if (config.placement === "app" || config.placement === "both") {
+      context.ui.slot({
+        append: "app",
+        render: () => <UsageBar showDetails={() => true} bar />,
+      })
+    }
+
+    return () => {
+      disposed = true
+      context.renderer.off("resize", onResize)
+      clearInterval(ticker)
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear()
+    }
+  },
+})

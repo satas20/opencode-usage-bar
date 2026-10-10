@@ -5,24 +5,28 @@
 An AI subscription usage gauge for the [opencode](https://opencode.ai) TUI.
 
 Shows how much of your coding-plan quota you've used and how long until it
-resets, in a full-width row just below the session footer. Supports
-**Claude Pro/Max** and **ChatGPT Plus/Pro (Codex)** — each optional, each
-with per-window toggles.
+resets. By default the gauge sits in the prompt footer row, next to the
+location and the context/cost readouts — compact by default, expanding to
+every enabled window when there is room — and a full-detail strip is
+right-aligned on the bottom row of the interface. Either surface can be
+disabled with `placement`. Supports **OpenCode Go/Plus**, **Claude Pro/Max**
+and **ChatGPT Plus/Pro (Codex)** — each optional, each with per-window toggles.
 
 ```
-┌─ opencode session ────────────────────────────────────┐
-│ ...                                                   │
-│ > _                                                   │
-│ Build · Claude Fable 5      ▓▓▓▓░░░░░░ 4/5 · todo bar │
-│ esc interrupt        119.8K (12%) · $4.04  ctrl+p     │
-│ ▓▓▓▓░░ 65% · 0h 11m                                   │
-└───────────────────────────────────────────────────────┘
+┌─ opencode session ──────────────────────────────────────────┐
+│ ...                                                         │
+│ > _                                                         │
+│ Build · Claude Fable 5                                      │
+│ ~/code/app  cld 5h ▓▓▓▓░ 65% · 0h 11m  119.8K · 12% · $4.04 │
+│ cld ▓▓▓▓░ 65% · 0h 11m   oai ▓░░░░ 12% · 3h 4m  (status bar)│
+└─────────────────────────────────────────────────────────────┘
 ```
 
 With multiple windows/providers enabled:
 
 ```
 cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h   oai ▓░░░░ 12% · 3h 4m
+ocg ░░░░░ 2% · 6d 9h  month ▓░░░░ 38% · 9d 21h
 ```
 
 When a provider's public status page reports an active incident, a colored
@@ -41,8 +45,12 @@ When a provider's public status page reports an active incident, a colored
   failures — these endpoints throttle aggressive polling).
 - Last known values are cached, so the bar appears instantly on restart.
 - Providers hide silently when credentials are missing/expired or a fetch
-  fails; the whole row hides when nothing is available.
-- Provider prefixes (`cld`/`oai`) appear only when two or more providers
+  fails; the gauge hides too when nothing is available, or when the footer row
+  is too narrow even for the compact form.
+- In the prompt footer the gauge shows the most constrained window per provider
+  and expands to the full list when the host reports room for details;
+  `placement = "footer"` (or `"app"`) disables the other surface.
+- Provider prefixes (`cld`/`oai`/`ocg`) appear only when two or more providers
   are visible; window labels (`5h`/`7d`/…) appear only when a provider shows
   two or more windows.
 
@@ -51,47 +59,47 @@ When a provider's public status page reports an active incident, a colored
 ### Recommended (npm)
 
 ```sh
-opencode plugin @satas/opencode-usage-bar
+opencode plugin add @satas/opencode-usage-bar
 ```
 
 This installs the package via Bun, detects the TUI entrypoint, and adds it to
-your `tui.json` automatically. Add `-g` to install globally
-(`~/.config/opencode/tui.json`).
+your global `cli.json` automatically.
 
 Or add it manually:
 
 ```jsonc
-// ~/.config/opencode/tui.json
+// ~/.config/opencode/cli.json
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["@satas/opencode-usage-bar"]
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": ["@satas/opencode-usage-bar"]
 }
 ```
 
-opencode auto-installs npm plugins at startup.
+### Local checkout (no build needed)
 
-### Local file (no build needed)
-
-opencode transpiles `.tsx` plugins on the fly, so you can point `tui.json`
-straight at the source file:
+opencode transpiles `.tsx` plugins on the fly, so you can point `cli.json`
+straight at a checkout — its root `tui.tsx` forwards to `src/index.tsx`:
 
 ```jsonc
+// ~/.config/opencode/cli.json
 {
-  "plugin": ["/absolute/path/to/opencode-usage-bar/src/index.tsx"]
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": ["/absolute/path/to/opencode-usage-bar"]
 }
 ```
 
 ## Configuration
 
 On first run the plugin creates `~/.config/opencode/usage-bar.toml` with
-commented defaults (Claude enabled, 5-hour window only — matching the
-screenshot above). Edit it and restart opencode; the config is read once at
-startup.
+commented defaults (Claude and OpenCode Go enabled, 5-hour window only for
+Claude — matching the screenshot above). Edit it and restart opencode; the
+config is read once at startup.
 
 ```toml
 [ui]
 show_bars = true      # render ▓▓░░ mini-bars (false = text only)
 show_status = true    # show a ! marker next to a provider during incidents
+placement = "both"    # footer (prompt footer), app (bottom strip), or both
 # bar_width = 6       # override bar width (default: 6 for a single window, 5 otherwise)
 
 [anthropic]
@@ -106,7 +114,18 @@ enabled = false       # ChatGPT Plus/Pro via the Codex CLI login
 show_5h = true
 show_7d = false
 # codex_auth_path = "~/.codex/auth.json"
+
+[opencode]
+enabled = true        # OpenCode Go/Plus via the Console account login (/connect)
+show_5h = true        # rolling 5-hour window
+show_7d = true        # UTC calendar week
+show_month = true     # paid billing period
 ```
+
+To enable the OpenCode Go/Plus provider, connect your Console account once —
+`/connect` in the TUI, then **OpenCode Console → OpenCode Console account**.
+The plugin reads that OAuth credential (refresh tokens are never touched) and
+calls the same `/api/go/status` endpoint the Console `Go` page uses.
 
 ## Providers & data sources
 
@@ -114,24 +133,28 @@ show_7d = false
 |---|---|---|---|---|
 | `anthropic` | Claude Code's `~/.claude/.credentials.json` → opencode's auth store | `api.anthropic.com/api/oauth/usage` | `status.anthropic.com` | 5h session, 7d all-models, 7d per-model |
 | `openai` | Codex CLI's `~/.codex/auth.json` → opencode's auth store | `chatgpt.com/backend-api/wham/usage` | `status.openai.com` | 5h session, 7d weekly |
+| `opencode` | opencode's Console account login (`/connect`); v2 credential store → legacy auth store | `opencode.ai/console/api/go/status` | — | 5h rolling, UTC week, paid period |
 
-If you log in through opencode itself (`opencode auth login`), everything works
-with zero extra setup — the plugin falls back to opencode's own auth store
-(`<data dir>/auth.json`, e.g. `~/.local/share/opencode/auth.json`). All
-credential access is **read-only**; expired tokens simply hide the provider
-until the owning CLI refreshes them.
+If you log in through opencode itself (`opencode auth login` / `/connect`),
+everything works with zero extra setup — the plugin falls back to opencode's
+own auth store (`<data dir>/auth.json`, e.g.
+`~/.local/share/opencode/auth.json`). All credential access is **read-only**;
+expired tokens simply hide the provider until the owning CLI refreshes them.
+The OpenCode Go credential is read from opencode's v2 credential store
+(`<data dir>/opencode.db`, table `credential`) because that is where v2 keeps
+account connections.
 
 **Security note:** each credential is read from disk/env and sent **only** to
 its own provider's API host, over HTTPS, to fetch usage numbers. The status
 check hits each vendor's public status page with no credentials at all.
-Nothing else is read, stored, or transmitted. Both usage endpoints are
+Nothing else is read, stored, or transmitted. All usage endpoints are
 undocumented/internal (the same ones the vendors' own tooling uses) and may
 change without notice.
 
 ## Develop
 
 ```sh
-bun install      # dev deps (solid-js, @opencode-ai/plugin, @opentui/solid, tsc)
+bun install      # dev deps (solid-js, @opencode/plugin, @opentui/solid, tsc)
 bun run build    # emit dist/index.js + dist/index.d.ts (for npm publish)
 bun run typecheck
 ```
@@ -144,10 +167,12 @@ automatically).
 - GLM coding plan (z.ai) provider.
 - Anthropic/OpenAI OAuth token auto-refresh (both credential files include a
   refresh token; for now the respective CLIs keep them fresh).
+- OpenCode Go token auto-refresh: the Console device login lasts ~30 days;
+  until the plugin refreshes it, reconnect with `/connect` when it expires.
 
 ## Requirements
 
-- opencode >= 1.17 (TUI plugin API, `@opencode-ai/plugin/tui`)
+- opencode >= 2.0 (TUI plugin API, `@opencode/plugin/tui`)
 - Bun runtime (used by opencode; `Bun.TOML` parses the config)
 
 ## Contributing

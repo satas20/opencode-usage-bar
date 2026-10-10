@@ -9,8 +9,8 @@ const result = await Bun.build({
   external: [
     "solid-js",
     "solid-js/*",
-    "@opencode-ai/plugin",
-    "@opencode-ai/plugin/*",
+    "@opencode/plugin",
+    "@opencode/plugin/*",
     "@opentui/solid",
     "@opentui/solid/*",
     "@opentui/core",

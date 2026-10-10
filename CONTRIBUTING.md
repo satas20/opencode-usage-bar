@@ -7,7 +7,7 @@ to review.
 ## Prerequisites
 
 - [Bun](https://bun.sh) (opencode's runtime; also used for the build)
-- [opencode](https://opencode.ai) >= 1.17 to test the TUI integration
+- [opencode](https://opencode.ai) >= 2.0 to test the TUI integration
 
 ## Setup
 
@@ -20,13 +20,14 @@ bun install
 ## Development loop
 
 You don't need a build step during development — opencode transpiles `.tsx`
-plugins on the fly. Point your `tui.json` at your working copy:
+plugins on the fly. Point your `cli.json` at your working copy (the root
+`tui.tsx` forwards to `src/index.tsx`):
 
 ```jsonc
-// ~/.config/opencode/tui.json
+// ~/.config/opencode/cli.json
 {
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["/absolute/path/to/opencode-usage-bar/src/index.tsx"]
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": ["/absolute/path/to/opencode-usage-bar"]
 }
 ```
 
@@ -45,6 +46,7 @@ bun run build       # bundles dist/index.js + emits dist/index.d.ts
 
 | Path | Purpose |
 |---|---|
+| `tui.tsx` | Local entrypoint for checkouts (forwards to `src/index.tsx`) |
 | `src/index.tsx` | The entire plugin: types, providers, config, TUI render |
 | `build.ts` | `Bun.build` bundling (Solid transform, externals) |
 | `dist/` | Build output, published to npm (gitignored) |
@@ -70,8 +72,10 @@ Checklist:
 
 1. Add the id to the `ProviderId` union.
 2. Implement the provider object; return `UsageWindow[]` (each window has a
-   `category` of `"5h" | "7d" | "model"`, a `percent` 0–100, and `resetsAt`
-   epoch ms) or `null` when credentials are missing/expired or the fetch fails.
+   `category` of `"5h" | "7d" | "model" | "month"`, a `percent` 0–100, and
+   `resetsAt` epoch ms) or `null` when credentials are missing/expired or the
+   fetch fails. Add `hasCredentials()` when a signed-out provider must clear
+   its cached windows instead of keeping the last known values.
 3. Add it to the `providers` array.
 4. Add a section to `DEFAULT_TOML`, an entry in `defaultConfig()`, and any
    provider-specific keys to `parseConfig()`.
